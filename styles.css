@@ -1,0 +1,13 @@
+.box{
+    background-color: blue;
+    color: white;
+    min-height: 100px;
+    text-align: center;
+}
+
+.box2{
+    background-color: red;
+    color:white;
+    min-height: 100px;
+    text-align: center;
+}
