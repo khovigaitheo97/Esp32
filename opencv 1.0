@@ -1,0 +1,427 @@
+import cv2
+import urllib.request
+import numpy as np
+import pickle
+import cvzone
+import requests
+import time
+import threading
+import pytesseract
+import re
+
+# ===================== CONFIG =====================
+ESP32_IP = "172.20.10.4"
+
+# Parking camera (spots)
+PARK_URL = "http://172.20.10.6/stream"
+PARK_POS_FILE = "CarParkingPos"
+TIMEOUT = 3.0
+SEND_KEEPALIVE_SEC = 2.0
+
+# Plate camera (OCR)
+PLATE_URL = "http://172.20.10.5/stream"
+PLATE_POS_FILE = "PlatePos"
+FLIP_PLATE = 1
+
+ROI1_W, ROI1_H = 110, 70
+ROI2_W, ROI2_H = 190, 95
+
+ESP32_PLATE_PATH = "/plate"
+HTTP_TIMEOUT = 0.8
+SEND_ONLY_ON_CHANGE = False
+MIN_SEND_INTERVAL = 0.4
+
+# Tesseract
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+# Common sizes
+width_img, height_img = 640, 480
+
+# ===================== STREAM READER (MJPEG) =====================
+class MJPEGStream:
+    def __init__(self, url, read_size=4096):
+        self.url = url
+        self.read_size = read_size
+        self._buf = b""
+        self._frame = None
+        self._lock = threading.Lock()
+        self._stop = False
+        self._t = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._t.start()
+        return self
+
+    def stop(self):
+        self._stop = True
+
+    def get_frame(self):
+        with self._lock:
+            return None if self._frame is None else self._frame.copy()
+
+    def _run(self):
+        while not self._stop:
+            try:
+                stream = urllib.request.urlopen(self.url, timeout=5)
+                self._buf = b""
+                while not self._stop:
+                    self._buf += stream.read(self.read_size)
+                    a = self._buf.find(b"\xff\xd8")
+                    b = self._buf.find(b"\xff\xd9")
+                    if a == -1 or b == -1 or b <= a:
+                        continue
+
+                    jpg = self._buf[a:b+2]
+                    self._buf = self._buf[b+2:]
+
+                    img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+                    if img is None:
+                        continue
+
+                    with self._lock:
+                        self._frame = img
+            except Exception:
+                time.sleep(0.5)
+
+# ===================== LOAD POSITIONS =====================
+with open(PARK_POS_FILE, "rb") as f:
+    park_posList = pickle.load(f)
+
+with open(PLATE_POS_FILE, "rb") as f:
+    plate_posList = pickle.load(f)
+
+if len(plate_posList) < 2:
+    raise ValueError("PlatePos phải có ít nhất 2 ROI (IN và OUT).")
+
+# Plate ROI1 (-2)
+if len(plate_posList[-2]) == 2:
+    px1, py1 = plate_posList[-2]
+    w1, h1 = ROI1_W, ROI1_H
+else:
+    px1, py1, w1, h1 = plate_posList[-2]
+
+# Plate ROI2 (-1)
+if len(plate_posList[-1]) == 2:
+    px2, py2 = plate_posList[-1]
+    w2, h2 = ROI2_W, ROI2_H
+else:
+    px2, py2, w2, h2 = plate_posList[-1]
+
+# ===================== PARKING LOGIC =====================
+width, height = 130, 100
+
+def checkParkingSpace(imgPro):
+    freeSpace = 0
+    condition_permit = 200
+    m = 6
+    spotInfo = []
+    for i, (x, y) in enumerate(park_posList[:6]):
+        spotID = i + 1
+        imgCrop = imgPro[y+m:y+height-m, x+m:x+width-m]
+        count = cv2.countNonZero(imgCrop)
+        if count <= condition_permit:
+            status = "free"
+            freeSpace += 1
+        else:
+            status = "occupied"
+        spotInfo.append((spotID, x, y, count, status))
+    return freeSpace, spotInfo
+
+def send_led_bulk(s6):
+    try:
+        r = requests.get(f"http://{ESP32_IP}/led", params={"s": s6}, timeout=TIMEOUT)
+        print("LED:", s6, "| ESP32 says:", r.text)
+        return True
+    except requests.RequestException as e:
+        print("HTTP failed LED:", e)
+        return False
+
+def send_msg(spotID, status):
+    try:
+        r = requests.get(f"http://{ESP32_IP}/msg", params={"spot": spotID, "status": status}, timeout=TIMEOUT)
+        print("Sent:", spotID, status, "| ESP32:", r.text)
+        return True
+    except requests.RequestException as e:
+        print("HTTP failed msg:", e)
+        return False
+
+def drawParking(imgShow, freeSpace, spotInfo):
+    warningCounter = 0
+    for (spotID, x, y, count, status) in spotInfo:
+        if status == "free":
+            color = (0, 255, 0)
+        elif status == "warning":
+            color = (0, 165, 255)
+            warningCounter += 1
+        else:
+            color = (0, 0, 255)
+
+        cv2.putText(imgShow, str(spotID), (x, y - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+
+        cv2.rectangle(imgShow, (x, y), (x + width, y + height), color, 2)
+
+        cvzone.putTextRect(imgShow, str(count),
+                           (x, y + height - 3),
+                           scale=1, thickness=2,
+                           offset=0, colorR=color)
+
+    cvzone.putTextRect(imgShow,
+                       f'Free: {freeSpace}/6',
+                       (20, 430),
+                       scale=1.3,
+                       thickness=2,
+                       offset=6,
+                       colorR=(0, 200, 0))
+
+# ===================== PLATE SEND =====================
+last_sent_plate = ""
+last_sent_time = 0.0
+
+def send_plate_to_esp32(plate_number: str):
+    global last_sent_plate, last_sent_time
+    if not plate_number:
+        return
+    now = time.time()
+    if now - last_sent_time < MIN_SEND_INTERVAL:
+        return
+    if SEND_ONLY_ON_CHANGE and plate_number == last_sent_plate:
+        return
+    try:
+        requests.get(
+            f"http://{ESP32_IP}{ESP32_PLATE_PATH}",
+            params={"n": plate_number},
+            timeout=HTTP_TIMEOUT
+        )
+        last_sent_plate = plate_number
+        last_sent_time = now
+    except:
+        pass
+
+# ===================== OCR HELPERS =====================
+def _clean_alnum(s: str) -> str:
+    return re.sub(r'[^A-Z0-9]', '', s.upper())
+
+def fix_plate_1char1digit(letter: str, digit: str) -> str:
+    """
+    Force format: [A-Z][0-9], and fix common confusions.
+    Main target: C1 vs I1.
+    """
+    letter = _clean_alnum(letter)
+    digit = _clean_alnum(digit)
+
+    # keep only 1 char each
+    letter = letter[:1] if letter else ""
+    digit = digit[:1] if digit else ""
+
+    # map letter mistakes in digit slot
+    map_letter_to_digit = {
+        "I": "1",
+        "L": "1",
+        "|": "1",
+        "O": "0",
+        "S": "5",
+        "B": "8",
+        "Z": "2",
+    }
+
+    # map digit mistakes in letter slot
+    map_digit_to_letter = {
+        "0": "O",
+        "1": "I",
+        "2": "Z",
+        "5": "S",
+        "8": "B",
+    }
+
+    # if letter slot is digit -> convert
+    if letter and letter.isdigit():
+        letter = map_digit_to_letter.get(letter, letter)
+
+    # if digit slot is letter -> convert
+    if digit and digit.isalpha():
+        digit = map_letter_to_digit.get(digit, digit)
+
+    # Special fix: if OCR returns I1 but you expect C1 often
+    # Only apply when digit is 1 (most common confusion) to avoid breaking other cases.
+    if letter == "I" and digit == "1":
+        letter = "C"
+
+    # final validate
+    if not (letter.isalpha() and digit.isdigit()):
+        return ""
+
+    return letter + digit
+
+def preprocess_for_ocr(roi_bgr):
+    gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+
+    # upscale to help small characters
+    gray = cv2.resize(gray, None, fx=5, fy=5, interpolation=cv2.INTER_CUBIC)
+
+    # slight blur then sharpen
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    blur = cv2.GaussianBlur(gray, (0, 0), 1.0)
+    gray = cv2.addWeighted(gray, 1.6, blur, -0.6, 0)
+
+    # OTSU threshold (invert)
+    thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+
+    # convert back to black text on white bg (better for tesseract sometimes)
+    ocr_img = cv2.bitwise_not(thr)
+    ocr_img = cv2.copyMakeBorder(ocr_img, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
+
+    return ocr_img, thr
+
+def ocr_plate_1char1digit(frame, px, py, rw, rh):
+    H, W = frame.shape[:2]
+    px = max(0, min(int(px), W - 1))
+    py = max(0, min(int(py), H - 1))
+    rw = max(1, min(int(rw), W - px))
+    rh = max(1, min(int(rh), H - py))
+
+    roi = frame[py:py+rh, px:px+rw]
+    if roi.size == 0:
+        return "", None, 0.0
+
+    ocr_img, thr = preprocess_for_ocr(roi)
+
+    # split left/right: left = letter, right = digit
+    h, w = ocr_img.shape
+    left_part = ocr_img[:, :w // 2]
+    right_part = ocr_img[:, w // 2:]
+
+    # Stronger configs:
+    # - psm 10: single character
+    # - whitelist
+    config_letter = r"--oem 3 --psm 10 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    config_digit  = r"--oem 3 --psm 10 -c tessedit_char_whitelist=0123456789"
+
+    raw_letter = pytesseract.image_to_string(left_part, config=config_letter)
+    raw_digit  = pytesseract.image_to_string(right_part, config=config_digit)
+
+    plate = fix_plate_1char1digit(raw_letter, raw_digit)
+
+    # simple confidence proxy: if valid plate -> 1 else 0
+    conf = 1.0 if plate else 0.0
+    return plate, thr, conf
+
+# ===================== MAIN: start 2 streams =====================
+park_stream = MJPEGStream(PARK_URL, read_size=1024).start()
+plate_stream = MJPEGStream(PLATE_URL, read_size=4096).start()
+
+# parking send states
+last_led_s = None
+last_send_time_led = 0.0
+last_spot_status = {}
+
+# plate smoothing
+last_good_plate = ""
+last_good_time = 0.0
+
+print("Running 2 cameras... Press 'q' to quit.")
+cv2.namedWindow("THRESH", cv2.WINDOW_NORMAL)
+cv2.resizeWindow("THRESH", 420, 220)
+
+while True:
+    # ---------- PARKING CAMERA ----------
+    park_frame = park_stream.get_frame()
+    if park_frame is not None:
+        img = cv2.flip(park_frame, 0)
+        img = cv2.resize(img, (width_img, height_img))
+
+        imgGray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        imgBlur = cv2.GaussianBlur(imgGray, (3, 3), 1)
+
+        imgThreshold = cv2.adaptiveThreshold(
+            imgBlur, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            25, 16
+        )
+        imgPro = cv2.medianBlur(imgThreshold, 5)
+
+        freeSpace, spotInfo = checkParkingSpace(imgPro)
+
+        # build s6
+        s6 = ""
+        for (spotID, x, y, count, status) in spotInfo:
+            s6 += "1" if status == "free" else "0"
+
+        now = time.time()
+        changed = (s6 != last_led_s)
+        keepalive = (now - last_send_time_led) >= SEND_KEEPALIVE_SEC
+        if changed or keepalive:
+            ok = send_led_bulk(s6)
+            if ok:
+                last_led_s = s6
+                last_send_time_led = now
+
+        # send msg only on change
+        for (spotID, x, y, count, status) in spotInfo:
+            prev_state = last_spot_status.get(spotID)
+            if prev_state != status:
+                ok = send_msg(spotID, status)
+                if ok:
+                    last_spot_status[spotID] = status
+
+        drawParking(img, freeSpace, spotInfo)
+        cv2.imshow("Parking STREAM", img)
+
+    # ---------- PLATE CAMERA ----------
+    plate_frame = plate_stream.get_frame()
+    if plate_frame is not None:
+        frame = cv2.flip(plate_frame, FLIP_PLATE)
+
+        # OCR ROI1 + ROI2
+        num1, thr1, conf1 = ocr_plate_1char1digit(frame, px1, py1, w1, h1)
+        num2, thr2, conf2 = ocr_plate_1char1digit(frame, px2, py2, w2, h2)
+
+        number, active = "", 0
+        if num1 and num2:
+            # both valid => keep ROI1 priority (or compare conf if you want)
+            number, active = num1, 1
+        elif num1:
+            number, active = num1, 1
+        elif num2:
+            number, active = num2, 2
+
+        now = time.time()
+        if number:
+            last_good_plate = number
+            last_good_time = now
+        elif last_good_plate and (now - last_good_time) < 0.8:
+            number = last_good_plate
+
+        if number:
+            send_plate_to_esp32(number)
+
+        # draw ROIs + show
+        cv2.rectangle(frame, (px1, py1), (px1 + w1, py1 + h1), (255, 0, 255), 2)
+        cv2.putText(frame, "ROI 1 (IN)", (px1, max(20, py1 - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+
+        cv2.rectangle(frame, (px2, py2), (px2 + w2, py2 + h2), (0, 255, 255), 2)
+        cv2.putText(frame, "ROI 2 (OUT)", (px2, max(20, py2 - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+        if number:
+            cv2.putText(frame, f"{number} (ROI {active})", (20, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0, 255, 0), 3)
+            if active == 1 and thr1 is not None:
+                cv2.imshow("THRESH", thr1)
+            elif active == 2 and thr2 is not None:
+                cv2.imshow("THRESH", thr2)
+        else:
+            cv2.putText(frame, "NO DETECT", (20, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0, 0, 255), 3)
+
+        cv2.imshow("Plate STREAM", frame)
+
+    # ---------- EXIT ----------
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+park_stream.stop()
+plate_stream.stop()
+cv2.destroyAllWindows()
